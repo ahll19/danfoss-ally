@@ -1,41 +1,167 @@
+# Danfoss Ally gateway replacement for Home Assistant
 
-# Danfoss Ally Gateway replacement functionality for Home Assistant
+This repository provides a Home Assistant automation blueprint and scripts for
+Danfoss Ally TRVs connected through Zigbee2MQTT. Create one automation per room
+and select that room's thermostats and external temperature sensors.
 
-This repository contains a blueprint and a script to integrate Danfoss Ally devices directly into Home Assistant, bypassing the need for the official Danfoss Ally gateway. The provided files enable easy configuration and control of Danfoss Ally devices within Home Assistant.
+## Files
 
-The thought is that you create an automation from the blueprint for each room in your setup, selecting the wanted temperature sensors and Ally thermostats. Home Assistant will then facilitate the communication between sensors and thermostats, just like the official gateway.
-
-## Files in This Repository
-
-- **`blueprint/danfoss-ally.yaml`**: The Home Assistant blueprint for configuring and automating Danfoss Ally devices.
-- **`script/danfoss-ally-room-assistant.yaml`**: A Home Assistant script for direct control of Danfoss Ally devices.
+- `blueprint/danfoss-ally.yaml`: room automation blueprint.
+- `script/danfoss-ally-room-assistant.yaml`: **two** scripts, named
+  `danfoss_ally_room_assistant` and `danfoss_ally_time_sync`.
 
 ## Installation
 
-### Step 1: Clone the Repository
-Clone or download this repository to your Home Assistant installation:
+1. Copy `blueprint/danfoss-ally.yaml` into
+   `config/blueprints/automation/eskholm/danfoss-ally.yaml`.
+2. Merge both entries from `script/danfoss-ally-room-assistant.yaml` into
+   Home Assistant's `scripts.yaml`. They are already formatted as
+   `scripts.yaml` entries: do **not** add another `script:` wrapper there.
+   If you manage scripts through the UI, create **both** scripts with those IDs.
+3. Reload scripts and automations (or restart Home Assistant).
+4. Create or update an automation from the blueprint for each room.
+   Select the optional supply temperature sensor if you use `heat_available`
+   (for example `sensor.temperature_01` with a threshold of 50 °C).
 
-```bash
-git clone https://github.com/eskholm/danfoss-ally.git
-```
+The blueprint calls `script.danfoss_ally_room_assistant`; the room assistant
+starts `script.danfoss_ally_time_sync` independently for each TRV.
 
-### Step 2: Add the Blueprint
-1. Open Home Assistant.
-2. Navigate to `Settings` > `Blueprints`.
-3. Click on the "Import Blueprint" button.
-4. Use the file `blueprint.yaml` from this repository to add the Danfoss Ally blueprint.
+## Operation and Zigbee traffic
 
-### Step 3: Add the Script
-1. Copy the file `danfoss_ally_script.yaml` to your Home Assistant `scripts/` folder.
-2. Go to `Settings` > `Scripts` in Home Assistant and verify that the script is available.
+- Every 10 minutes, each room gets a random 0–119 second offset. Its
+  thermostats then receive their external room temperature and average load,
+  staggered by another 2–5 seconds per thermostat.
+- Once per hour, each thermostat also receives an independent time
+  synchronization job delayed by a random 0–3599 seconds. The job does not
+  block setpoint or temperature updates. `time` is measured from the UTC
+  Zigbee epoch (2000-01-01). The time-zone attribute is the
+  standard offset without DST; `dstShift` is sent separately.
+- Setpoint changes are synchronized without waiting for the periodic update.
+  When a thermostat's reported external sensor value differs from the latest
+  room temperature by at least 0.1°C, or the sensor feedback state is older
+  than 5 minutes, its MQTT request includes both external temperature and
+  occupied heating setpoint. The source TRV may receive a temperature-only
+  message because it already has the new target. The feedback is normally
+  exposed as a `number.*_external_measured_room_sensor` entity associated
+  with the same Home Assistant device. When that feedback is missing or
+  unavailable, the temperature is sent as a conservative fallback.
+- Setpoint events are queued per room and echoed updates that already agree
+  with the other TRVs are ignored. Mirrored requests are separated by 1–3
+  seconds. A five-second settling interval lets mirrored targets be
+  reported before the next queued event is checked. A periodic update
+  runs non-blockingly, preserving its 0–119 second jitter without
+  blocking setpoints.
+- A combined MQTT JSON payload may still produce multiple Zigbee writes in
+  Zigbee2MQTT. This is traffic reduction, not a global Zigbee rate limiter.
+- Window-entity changes cause an immediate room-data refresh. The blueprint
+  does **not** change `window_open_external` or a window switch.
+- Unavailable external temperature sensors are excluded from the mean. If
+  none are valid, external temperatures are not published. Missing/invalid
+  load estimates are excluded, and an absent room load is sent as `-8000`.
+- The optional supply temperature sensor controls each existing
+  `switch.*_heat_available` entity only when its state needs changing.
 
-### Step 4: Configure Your Devices
-1. Pair your Danfoss Ally devices with your Zigbee network.
-2. Use the blueprint and script to control and automate your Danfoss Ally devices.
+This is per-room pacing, **not** a global Zigbee rate limiter. With many
+rooms, traffic can still overlap. Time synchronization jobs are capped at
+250 concurrent runs; increase the helper script's `max` if needed.
 
-## Usage
+The scripts use the automatic IEEE-to-topic route registry described below.
+Missing or ambiguous routes are treated as errors, never guessed.
 
-Once the files are set up, you can automate and control your Danfoss Ally devices within Home Assistant. Use the blueprint to create automations and the script for manual control of the devices.
+Danfoss Ally in radiator-covered / external-room-sensor mode needs a fresh
+external temperature within 30 minutes. The periodic 10-minute refresh
+provides margin, assuming Home Assistant and Zigbee2MQTT are functioning.
+
+## Following a run in Activity (Logbook)
+
+Every Room Assistant run writes a START and END entry with the same
+`[run_id]` (for example `[20261009-205500-123456]`). Entries include the
+invocation reason, source/target setpoint, first TRV used as the room key,
+mean temperature/load, number of TRVs, and elapsed time. Open **Activity**
+(Logbook) in Home Assistant and filter on the first climate entity in
+the room. Use the run ID to relate entries in a busy room. A missing END
+entry suggests the run was interrupted or failed and should be checked in
+the script trace and HA logs; START/END do not confirm physical Zigbee
+delivery.
+
+Enable **Detailed run logging** in an individual room's blueprint instance
+to additionally record CALC, per-TRV MQTT sends, switch commands and clock
+updates. Default is off to avoid unnecessarily growing Recorder. The delayed
+clock updates use the originating room run ID, even when they finish much
+later. Clock details are only logged when detailed logging was enabled at
+the time the job was scheduled.
+
+Room Assistant retains 100 traces, and the high-volume time-sync helper
+retains 20. Trace retention is still bounded; Activity log entries follow
+the Recorder retention configuration. The Activity logger is affected by
+Logbook include/exclude filters. Changing logging does not create MQTT or
+Zigbee traffic.
+
+## Automatic Zigbee2MQTT routing (required)
+
+All Zigbee2MQTT instances must publish to the **same MQTT broker** and have
+different single-segment `base_topic` values (e.g. `zigbee2mqtt` and
+`zigbee2mqttstueplan`).
+
+Install `template/danfoss-ally-routes.yaml` **before installing the new
+Room Assistant script**:
+
+1. Merge the list item in that file into your existing `template:` YAML
+   configuration. If you have no existing `template:` key, you can use
+   `template: !include template/danfoss-ally-routes.yaml` in
+   `configuration.yaml` after placing the file in that directory.
+   Do not create a second `template:` key.
+2. Check Home Assistant's YAML configuration and reload Template entities
+   (or restart Home Assistant). The new entity is normally
+   `sensor.danfoss_ally_mqtt_routes`. Rename it to that exact entity ID
+   in the entity registry if Home Assistant chooses another.
+3. In **Developer Tools → Template**, check that the expected route exists:
+   ```jinja2
+   {{ state_attr('sensor.danfoss_ally_mqtt_routes', 'routes')
+      .get('0x3410f4fffe60c454') }}
+   ```
+   For this example, the route must contain
+   `zigbee2mqttstueplan/Radiator dagligstuen 2/set`.
+4. Only after route discovery has populated all the required TRVs, deploy
+   the new Room Assistant script and reload scripts.
+
+The routing sensor subscribes to `+/bridge/devices`, which picks up all
+single-level Zigbee2MQTT network roots automatically. Each instance's
+retained device list contains physical IEEE addresses and its actual
+Zigbee2MQTT `friendly_name`. Only Danfoss devices (based on the
+`definition.vendor` field) are indexed.
+
+The Room Assistant obtains its radiator's IEEE address from Home Assistant's
+MQTT device-registry identifier, normally
+`('mqtt', 'zigbee2mqtt_0x<IEEE>')`. It looks that address up in the routing
+sensor and publishes directly to the correct root and device name.
+
+When devices move between bridges or their Zigbee2MQTT names change, the next
+`bridge/devices` update refreshes the corresponding route. When a device
+appears in two bridge lists, its IEEE address is listed in the
+`duplicates` attribute and both writes are suppressed until the
+conflict is resolved. This is intentionally fail-closed: an unknown or
+ambiguous route emits a Logbook warning and system-log warning rather than
+silently falling back to `zigbee2mqtt`.
+
+The old `input_text.<device>_base_topic` helpers are no longer used and can
+be removed **after** routing is verified. MQTT bridge payloads are retained
+and the trigger-based sensor restores its last state after a restart.
+If any bridge does not publish retained `bridge/devices`, its routes may
+remain stale until the bridge publishes its device list.
+
+The routing map is stored in a sensor attribute. To keep it reasonably small,
+only devices whose Zigbee2MQTT vendor contains `Danfoss` are stored.
+The map is managed by Home Assistant's Recorder; do not exclude the routing
+sensor from Recorder if you want its state restored on restart.
+
+## Migration from the earlier version
+
+Both scripts must be installed together. Previous automation instances should
+be reloaded after updating the blueprint. The original repository did not
+include `heat_available`; if you use that behavior locally, select the new
+optional sensor in the blueprint.
 
 ## License
-This project is licensed under the GPLv3 License - see the [LICENSE](LICENSE) file for details.
+
+GPL-3.0; see [LICENSE](LICENSE).
